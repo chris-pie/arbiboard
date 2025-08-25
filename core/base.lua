@@ -4,6 +4,9 @@ BASE_ARBIBOARD._save_history = false
 BASE_ARBIBOARD._history = {}
 BASE_ARBIBOARD._transaction_layer = 1
 BASE_ARBIBOARD._nextID = 1
+BASE_ARBIBOARD._object_registry = {}
+BASE_ARBIBOARD._history_cursor = nil  -- nil = live; number = browsing at that move index
+BASE_ARBIBOARD._init_request = nil
 
 
 function BASE_ARBIBOARD.createGameObject()
@@ -141,19 +144,26 @@ function BASE_ARBIBOARD.createGameObject()
 
     setmetatable(proxy, mt)
     proxy.commit_changes()
+    BASE_ARBIBOARD._object_registry[proxy["BASE_FIELD_gameobject_id"]] = proxy
     return proxy
 end
 
-function BASE_ARBIBOARD.commit_all_tables()
+function BASE_ARBIBOARD.commit_all_tables(request)
 
     local step_history = {}
-    if BASE_ARBIBOARD._transaction_layer == 1 and BASE_ARBIBOARD._save_history then
-        table.insert(BASE_ARBIBOARD._history, step_history)
+    if BASE_ARBIBOARD._transaction_layer == 1 then
+        if BASE_ARBIBOARD._save_history then
+            table.insert(BASE_ARBIBOARD._history, step_history)
+        else
+            table.insert(BASE_ARBIBOARD._history, request)
+        end
     end
+
     for k, v in pairs(BASE_ARBIBOARD._modified_tables[BASE_ARBIBOARD._transaction_layer]) do
         if BASE_ARBIBOARD._transaction_layer == 1 and BASE_ARBIBOARD._save_history then
             local object_changes = v.BASE_METHOD_list_changes()
             local trimmed_changes = {}
+            trimmed_changes.move = request
             trimmed_changes.added = BASE_ARBIBOARD.shallow_copy(object_changes.added)
             trimmed_changes.removed = BASE_ARBIBOARD.shallow_copy(object_changes.removed)
             trimmed_changes.modified_old = BASE_ARBIBOARD.shallow_copy(object_changes.modified)
@@ -178,6 +188,9 @@ function BASE_ARBIBOARD.restore_all_tables()
 end
 
 function BASE_ARBIBOARD.move(request)
+    if BASE_ARBIBOARD._history_cursor ~= nil then
+        error("ERROR FROM BASE SCRIPT: Cannot make moves while browsing history. Exit history browsing first.")
+    end
     if type(API) ~= "table" then
         error("ERROR FROM BASE SCRIPT: API table is not defined")
     end
@@ -187,7 +200,7 @@ function BASE_ARBIBOARD.move(request)
     local success, message = API.move(request)
     if type(success) == "boolean" and type(message) == "string" then
         if success then
-            BASE_ARBIBOARD.commit_all_tables()
+            BASE_ARBIBOARD.commit_all_tables(request)
         else
             BASE_ARBIBOARD.restore_all_tables()
         end
@@ -205,8 +218,14 @@ function BASE_ARBIBOARD.init(request, history)
         error("ERROR FROM BASE SCRIPT: API.init function is not defined. It should be defined in API script.")
     end
     BASE_ARBIBOARD._save_history = history
+    if not history then
+        -- Requests-only history mode (replay fallback)
+        -- Object registry can be weak to avoid leaks; objects are always reachable while game is live.
+        setmetatable(BASE_ARBIBOARD._object_registry, {__mode="v"})
+    end
+    BASE_ARBIBOARD._init_request = request
     local message = API.init(request)
-    BASE_ARBIBOARD.commit_all_tables()
+    BASE_ARBIBOARD.commit_all_tables(request)
     if type(message) == "string" then
         return message
     else
@@ -215,6 +234,9 @@ function BASE_ARBIBOARD.init(request, history)
 end
 
 function BASE_ARBIBOARD.query(requests)
+    if BASE_ARBIBOARD._history_cursor ~= nil then
+        error("ERROR FROM BASE SCRIPT: Cannot run queries while browsing history. Exit history browsing first.")
+    end
     local responses = {}
     if type(API) ~= "table" then
         error("ERROR FROM BASE SCRIPT: API table is not defined")
@@ -296,4 +318,164 @@ function BASE_ARBIBOARD.trim_table(orig)
         copy[orig_key] = orig_value
     end
     return copy
+end
+
+-- Replay fallback helpers (requests-only mode)
+local function _replay_reset_to_beginning()
+    if type(API) ~= "table" or type(API.init) ~= "function" then
+        error("ERROR FROM BASE SCRIPT: API.init is required for replay fallback.")
+    end
+    if BASE_ARBIBOARD._init_request == nil then
+        error("ERROR FROM BASE SCRIPT: Replay fallback requires prior init request.")
+    end
+    -- Clear any browsing-layer edits, then re-run init on the browsing layer
+    BASE_ARBIBOARD.restore_all_tables()
+    local message = API.init(BASE_ARBIBOARD._init_request)
+    BASE_ARBIBOARD.commit_all_tables(BASE_ARBIBOARD._init_request)
+    if type(message) ~= "string" then
+        error("ERROR FROM BASE SCRIPT: API.init must return a string message for replay fallback.")
+    end
+end
+
+local function _replay_apply_move_request(req)
+    if type(API) ~= "table" or type(API.move) ~= "function" then
+        error("ERROR FROM BASE SCRIPT: API.move is required for replay fallback.")
+    end
+    local ok, msg = API.move(req)
+    if ok ~= true then
+        BASE_ARBIBOARD.restore_all_tables()
+        error("ERROR FROM BASE SCRIPT: Replay failed on a move request. The move did not succeed during replay.")
+    end
+    BASE_ARBIBOARD.commit_all_tables(req)
+end
+
+local function _replay_range(from_idx_inclusive, to_idx_inclusive)
+    for i = from_idx_inclusive, to_idx_inclusive do
+        local req = BASE_ARBIBOARD._history[i]
+        if req ~= nil then
+            _replay_apply_move_request(req)
+        end
+    end
+end
+
+function BASE_ARBIBOARD.history_start()
+    if BASE_ARBIBOARD._history_cursor ~= nil then
+        return -- already in browsing mode
+    end
+    -- Open browsing layer
+    BASE_ARBIBOARD._transaction_layer = BASE_ARBIBOARD._transaction_layer + 1
+    BASE_ARBIBOARD._modified_tables[BASE_ARBIBOARD._transaction_layer] = {}
+
+    if BASE_ARBIBOARD._save_history then
+        BASE_ARBIBOARD._history_cursor = #BASE_ARBIBOARD._history
+    else
+        -- Replay fallback: rebuild end-of-game state on browsing layer
+        _replay_reset_to_beginning()
+        BASE_ARBIBOARD._history_cursor = 1
+    end
+end
+
+function BASE_ARBIBOARD.history_exit()
+    if BASE_ARBIBOARD._history_cursor == nil then
+        return
+    end
+    -- Discard browsing-layer mutations and close the layer
+    BASE_ARBIBOARD.restore_all_tables()
+    BASE_ARBIBOARD._modified_tables[BASE_ARBIBOARD._transaction_layer] = nil
+    BASE_ARBIBOARD._transaction_layer = BASE_ARBIBOARD._transaction_layer - 1
+    BASE_ARBIBOARD._history_cursor = nil
+end
+
+function BASE_ARBIBOARD.history_back(steps)
+    if BASE_ARBIBOARD._history_cursor == nil then
+        error("ERROR FROM BASE SCRIPT: Not in history browsing mode. Call history_start() first.")
+    end
+    steps = tonumber(steps) or 1
+    if steps < 0 then return BASE_ARBIBOARD.history_forward(-steps) end
+    local target = BASE_ARBIBOARD._history_cursor - steps
+    if target < 0 then target = 0 end
+
+    if BASE_ARBIBOARD._save_history then
+        while BASE_ARBIBOARD._history_cursor > target do
+            local step = BASE_ARBIBOARD._history[BASE_ARBIBOARD._history_cursor]
+            if step ~= nil then
+                _apply_step_backward(step)
+            end
+            BASE_ARBIBOARD._history_cursor = BASE_ARBIBOARD._history_cursor - 1
+        end
+        return BASE_ARBIBOARD._history_cursor
+    else
+        -- Replay fallback: reset to beginning, then replay up to target
+        _replay_reset_to_beginning()
+        if target > 0 then
+            _replay_range(1, target)
+        end
+        BASE_ARBIBOARD._history_cursor = target
+        return BASE_ARBIBOARD._history_cursor
+    end
+end
+
+function BASE_ARBIBOARD.history_forward(steps)
+    if BASE_ARBIBOARD._history_cursor == nil then
+        error("ERROR FROM BASE SCRIPT: Not in history browsing mode. Call history_start() first.")
+    end
+    steps = tonumber(steps) or 1
+    if steps < 0 then return BASE_ARBIBOARD.history_back(-steps) end
+    local target = BASE_ARBIBOARD._history_cursor + steps
+    local last = #BASE_ARBIBOARD._history
+    if target > last then target = last end
+
+    if BASE_ARBIBOARD._save_history then
+        while BASE_ARBIBOARD._history_cursor < target do
+            local step = BASE_ARBIBOARD._history[BASE_ARBIBOARD._history_cursor + 1]
+            if step ~= nil then
+                _apply_step_forward(step)
+            end
+            BASE_ARBIBOARD._history_cursor = BASE_ARBIBOARD._history_cursor + 1
+        end
+        return BASE_ARBIBOARD._history_cursor
+    else
+        -- Replay only the needed forward moves
+        if target > BASE_ARBIBOARD._history_cursor then
+            _replay_range(BASE_ARBIBOARD._history_cursor + 1, target)
+        end
+        BASE_ARBIBOARD._history_cursor = target
+        return BASE_ARBIBOARD._history_cursor
+    end
+end
+
+function BASE_ARBIBOARD.history_goto(index)
+    if BASE_ARBIBOARD._history_cursor == nil then
+        error("ERROR FROM BASE SCRIPT: Not in history browsing mode. Call history_start() first.")
+    end
+    index = math.floor(tonumber(index) or 0)
+    if index < 0 then index = 0 end
+    local last = #BASE_ARBIBOARD._history
+    if index > last then index = last end
+
+    if BASE_ARBIBOARD._save_history then
+        local delta = index - BASE_ARBIBOARD._history_cursor
+        if delta > 0 then
+            return BASE_ARBIBOARD.history_forward(delta)
+        elseif delta < 0 then
+            return BASE_ARBIBOARD.history_back(-delta)
+        else
+            return BASE_ARBIBOARD._history_cursor
+        end
+    else
+        -- Replay fallback:
+        -- If going backwards or to an earlier index, reset and replay to index.
+        -- If going forward, replay only the forward gap.
+        if index <= BASE_ARBIBOARD._history_cursor then
+            _replay_reset_to_beginning()
+            if index > 0 then
+                _replay_range(1, index)
+            end
+            BASE_ARBIBOARD._history_cursor = index
+        else
+            _replay_range(BASE_ARBIBOARD._history_cursor + 1, index)
+            BASE_ARBIBOARD._history_cursor = index
+        end
+        return BASE_ARBIBOARD._history_cursor
+    end
 end
