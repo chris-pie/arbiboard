@@ -30,7 +30,7 @@ void copy_message(string_sized* response, lua_State* L, vc_vector* history) {
     strcpy_s(response->str, response_len+1, response_new);
     if(history) {
         char* response_copy = malloc(response_len + 1);
-        strcpy(response_copy, response_new);
+        strcpy_s(response_copy, response_len + 1, response_new);
         vc_vector_append(history, &response_copy, 1);
     }
     lua_pop(L, 1);
@@ -72,7 +72,7 @@ void panic(board_state* board, const char* error, const bool include_lua_err) {
 board_state init_game(const char *rules_script, const char *api_script, const char* init_request, const bool history) {
     lua_State *L = luaL_newstate();
     if (L == NULL) {
-        board_state board = {NULL, NULL, NULL};
+        board_state board = {nullptr, nullptr, nullptr};
         panic(&board, "ERROR FROM ARBIBOARD: Error allocating Lua state", false);
         return board;
     }
@@ -87,10 +87,10 @@ board_state init_game(const char *rules_script, const char *api_script, const ch
     board_response* response = malloc(sizeof(board_response));
     response->len = INIT_RESPONSE_LENGTH;
     response->str = malloc(INIT_RESPONSE_LENGTH);
-    board_state board =  {board_internal, response, NULL};
+    board_state board =  {board_internal, response, nullptr};
     board.state->L = L;
     board.state->keep_history = history;
-    board.state->query_responses = vc_vector_create(0, sizeof(query_response), NULL);
+    board.state->query_responses = vc_vector_create(0, sizeof(query_response), nullptr);
     if(history) {
         board.request_history = vc_vector_create(0, sizeof(char*), deleter);
         board.response_history = vc_vector_create(0, sizeof(char*), deleter);
@@ -99,8 +99,8 @@ board_state init_game(const char *rules_script, const char *api_script, const ch
         vc_vector_append(board.request_history, &request_copy, 1);
     }
     else {
-        board.request_history = NULL;
-        board.response_history = NULL;
+        board.request_history = nullptr;
+        board.response_history = nullptr;
     }
 
     const char* base_script =
@@ -219,7 +219,7 @@ vc_vector* query(board_state* board, int query_number, char** queries) {
     }
     if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
         panic(board, "ERROR FROM ARBIBOARD: Error while making a query: ", true);
-        return NULL;
+        return nullptr;
     }
     for(int i = 0; i<query_number; i++) {
         lua_geti(L, -1, i + 1);
@@ -245,4 +245,82 @@ vc_vector* query(board_state* board, int query_number, char** queries) {
     }
     lua_pop(L, 2);
     return board->state->query_responses;
+}
+
+bool history_start(board_state* board) {
+    lua_State *L = board->state->L;
+    lua_getglobal(L, "BASE_ARBIBOARD");
+    lua_getfield(L, -1, "history_start");
+    if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        panic(board, "ERROR FROM ARBIBOARD: Error while starting history mode: ", true);
+        return false;
+    }
+    lua_pop(L, 1); // pop BASE_ARBIBOARD
+    return true;
+}
+
+bool history_exit(board_state* board) {
+    lua_State *L = board->state->L;
+    lua_getglobal(L, "BASE_ARBIBOARD");
+    lua_getfield(L, -1, "history_exit");
+    if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        panic(board, "ERROR FROM ARBIBOARD: Error while exiting history mode: ", true);
+        return false;
+    }
+    lua_pop(L, 1); // pop BASE_ARBIBOARD
+    return true;
+}
+
+int history_back(board_state* board, int steps) {
+    lua_State *L = board->state->L;
+    lua_getglobal(L, "BASE_ARBIBOARD");
+    lua_getfield(L, -1, "history_back");
+    lua_pushinteger(L, steps);
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        panic(board, "ERROR FROM ARBIBOARD: Error while moving back in history: ", true);
+        return -2;
+    }
+    int cursor = (int)lua_tointeger(L, -1);
+    lua_pop(L, 2); // result and BASE_ARBIBOARD
+    return cursor;
+}
+
+int history_forward(board_state* board, int steps) {
+    lua_State *L = board->state->L;
+    lua_getglobal(L, "BASE_ARBIBOARD");
+    lua_getfield(L, -1, "history_forward");
+    lua_pushinteger(L, steps);
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        panic(board, "ERROR FROM ARBIBOARD: Error while moving forward in history: ", true);
+        return -2;
+    }
+    int cursor = (int)lua_tointeger(L, -1);
+    lua_pop(L, 2); // result and BASE_ARBIBOARD
+    return cursor;
+}
+
+int history_goto(board_state* board, int index) {
+    lua_State *L = board->state->L;
+    lua_getglobal(L, "BASE_ARBIBOARD");
+    lua_getfield(L, -1, "history_goto");
+    lua_pushinteger(L, index);
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        panic(board, "ERROR FROM ARBIBOARD: Error while jumping to history index: ", true);
+        return -2;
+    }
+    int cursor = (int)lua_tointeger(L, -1);
+    lua_pop(L, 2); // result and BASE_ARBIBOARD
+    return cursor;
+}
+
+int get_history_cursor(board_state* board) {
+    lua_State *L = board->state->L;
+    lua_getglobal(L, "BASE_ARBIBOARD");
+    lua_getfield(L, -1, "_history_cursor");
+    int cursor = -1; // -1 signifies "live" (nil cursor)
+    if (!lua_isnil(L, -1)) {
+        cursor = (int)lua_tointeger(L, -1);
+    }
+    lua_pop(L, 2); // _history_cursor and BASE_ARBIBOARD
+    return cursor;
 }

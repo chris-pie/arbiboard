@@ -1,7 +1,3 @@
-//
-// Created by Krzych on 25/06/2024.
-//
-
 #include "debugdemon.h"
 
 #include <stdio.h>

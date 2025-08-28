@@ -1,5 +1,5 @@
 BASE_ARBIBOARD = {}
-BASE_ARBIBOARD._modified_tables = {{}}
+BASE_ARBIBOARD._modified_tables = {}
 BASE_ARBIBOARD._save_history = false
 BASE_ARBIBOARD._history = {}
 BASE_ARBIBOARD._transaction_layer = 1
@@ -7,9 +7,37 @@ BASE_ARBIBOARD._nextID = 1
 BASE_ARBIBOARD._object_registry = {}
 BASE_ARBIBOARD._history_cursor = nil  -- nil = live; number = browsing at that move index
 BASE_ARBIBOARD._init_request = nil
+BASE_ARBIBOARD._functions = {}
+BASE_ARBIBOARD._function_names = {}
+BASE_ARBIBOARD._is_initializing = false
 
+local function _resolve_id(val)
+    if type(val) == "string" then
+        local obj = BASE_ARBIBOARD._object_registry[val]
+        if obj ~= nil then return obj end
+        local fn = BASE_ARBIBOARD._function_names[val]
+        if fn ~= nil then return fn end
+    end
+    return val
+end
 
-function BASE_ARBIBOARD.createGameObject()
+-- Adds a function to the registry.
+-- _function_names[name] = func and _functions[func] = name
+function BASE_ARBIBOARD.add_function(func, name)
+    if not BASE_ARBIBOARD._is_initializing then
+        error("BASE_ARBIBOARD.add_function: this function can only be called during init. ")
+    end
+    if type(func) ~= "function" then
+        error("BASE_ARBIBOARD.add_function: 'func' must be a function")
+    end
+    if type(name) ~= "string" or name == "" then
+        error("BASE_ARBIBOARD.add_function: 'name' must be a non-empty string")
+    end
+    BASE_ARBIBOARD._function_names['BASE_ARBIBOARD_function_'..name] = func
+    BASE_ARBIBOARD._functions[func] = 'BASE_ARBIBOARD_function_'..name
+end
+
+function BASE_ARBIBOARD.create_game_object()
     local data = {}
     local transactions = {}
 
@@ -22,6 +50,12 @@ function BASE_ARBIBOARD.createGameObject()
                 if value.BASE_METHOD_commit_changes == nil then
                     error("Attempted to assign a plain Lua table to key '" .. tostring(key) ..
                             "' in a tracked gameobject. Only gameobjects are allowed.", 2)
+                end
+            elseif type(value) == "function" then
+                -- Only functions registered via BASE_ARBIBOARD.add_function are allowed
+                if BASE_ARBIBOARD._functions[value] == nil then
+                    error("Attempted to assign an unregistered function to key '" .. tostring(key) ..
+                          "'. Use BASE_ARBIBOARD.add_function(func, name) first.", 2)
                 end
             end
             BASE_ARBIBOARD._modified_tables[BASE_ARBIBOARD._transaction_layer][t] = t
@@ -148,7 +182,7 @@ function BASE_ARBIBOARD.createGameObject()
     return proxy
 end
 
-function BASE_ARBIBOARD.commit_all_tables(request)
+function BASE_ARBIBOARD._commit_all_tables(request)
 
     local step_history = {}
     if BASE_ARBIBOARD._transaction_layer == 1 then
@@ -164,12 +198,12 @@ function BASE_ARBIBOARD.commit_all_tables(request)
             local object_changes = v.BASE_METHOD_list_changes()
             local trimmed_changes = {}
             trimmed_changes.move = request
-            trimmed_changes.added = BASE_ARBIBOARD.shallow_copy(object_changes.added)
-            trimmed_changes.removed = BASE_ARBIBOARD.shallow_copy(object_changes.removed)
-            trimmed_changes.modified_old = BASE_ARBIBOARD.shallow_copy(object_changes.modified)
+            trimmed_changes.added = BASE_ARBIBOARD._shallow_copy(object_changes.added)
+            trimmed_changes.removed = BASE_ARBIBOARD._shallow_copy(object_changes.removed)
+            trimmed_changes.modified_old = BASE_ARBIBOARD._shallow_copy(object_changes.modified)
             trimmed_changes.modified_new = {}
-            for k1, v1 in pairs(trimmed_changes.modified_old) do
-                trimmed_changes.modified_new[k1] = BASE_ARBIBOARD.trim_table(v1)
+            for k1, v1 in pairs(object_changes.modified) do
+                trimmed_changes.modified_new[_resolve_id[k1]] = _resolve_id(v[k1])
             end
 
             step_history[k.BASE_FIELD_gameobject_id] = trimmed_changes
@@ -180,7 +214,7 @@ function BASE_ARBIBOARD.commit_all_tables(request)
 end
 
 
-function BASE_ARBIBOARD.restore_all_tables()
+function BASE_ARBIBOARD._restore_all_tables()
     for k, v in pairs(BASE_ARBIBOARD._modified_tables[BASE_ARBIBOARD._transaction_layer]) do
         v.BASE_METHOD_restore()
     end
@@ -200,9 +234,9 @@ function BASE_ARBIBOARD.move(request)
     local success, message = API.move(request)
     if type(success) == "boolean" and type(message) == "string" then
         if success then
-            BASE_ARBIBOARD.commit_all_tables(request)
+            BASE_ARBIBOARD._commit_all_tables(request)
         else
-            BASE_ARBIBOARD.restore_all_tables()
+            BASE_ARBIBOARD._restore_all_tables()
         end
         return success, message
     else
@@ -211,6 +245,7 @@ function BASE_ARBIBOARD.move(request)
 end
 
 function BASE_ARBIBOARD.init(request, history)
+    BASE_ARBIBOARD._is_initializing = true
     if type(API) ~= "table" then
         error("ERROR FROM BASE SCRIPT: API table is not defined")
     end
@@ -225,12 +260,13 @@ function BASE_ARBIBOARD.init(request, history)
     end
     BASE_ARBIBOARD._init_request = request
     local message = API.init(request)
-    BASE_ARBIBOARD.commit_all_tables(request)
+    BASE_ARBIBOARD._commit_all_tables(request)
     if type(message) == "string" then
         return message
     else
         error(string.format("ERROR FROM BASE SCRIPT: Invalid return type from API.init function in API script: %s", type(message)))
     end
+    BASE_ARBIBOARD._is_initializing = false
 end
 
 function BASE_ARBIBOARD.query(requests)
@@ -256,7 +292,7 @@ function BASE_ARBIBOARD.query(requests)
         end
 
     end
-    BASE_ARBIBOARD.restore_all_tables()
+    BASE_ARBIBOARD._restore_all_tables()
     return responses
 end
 
@@ -269,7 +305,7 @@ function BASE_ARBIBOARD._simulate_moves(init, requests)
         local success, message = API.move(request)
         table.insert(responses, {["request"] = v, ["message"] = message, ["success"] = success})
         if not success then
-            BASE_ARBIBOARD.restore_all_tables()
+            BASE_ARBIBOARD._restore_all_tables()
             break
         end
     end
@@ -278,7 +314,7 @@ end
 
 function BASE_ARBIBOARD.simulate_moves(init, requests)
     local responses = BASE_ARBIBOARD._simulate_moves(init, requests)
-    BASE_ARBIBOARD.restore_all_tables()
+    BASE_ARBIBOARD._restore_all_tables()
     BASE_ARBIBOARD._modified_tables[BASE_ARBIBOARD._transaction_layer] = nil
     BASE_ARBIBOARD._transaction_layer = BASE_ARBIBOARD._transaction_layer - 1
     return responses
@@ -287,18 +323,24 @@ end
 
 function BASE_ARBIBOARD.try_moves(init, requests)
     local responses = BASE_ARBIBOARD._simulate_moves(init, requests)
-    BASE_ARBIBOARD.commit_all_tables()
+    BASE_ARBIBOARD._commit_all_tables()
     BASE_ARBIBOARD._modified_tables[BASE_ARBIBOARD._transaction_layer] = nil
     BASE_ARBIBOARD._transaction_layer = BASE_ARBIBOARD._transaction_layer - 1
     return responses
 end
 
 
-function BASE_ARBIBOARD.shallow_copy(orig)
+function BASE_ARBIBOARD._shallow_copy(orig)
     local orig_type = type(orig)
     local copy
     if orig_type == 'table' then
-        copy = BASE_ARBIBOARD.trim_table(orig)
+        copy = BASE_ARBIBOARD._trim_table(orig)
+    elseif orig_type == 'function' then
+        local name = BASE_ARBIBOARD._functions[orig]
+        if name == nil then
+            error("BASE_ARBIBOARD.shallow_copy: encountered unregistered function; register it with BASE_ARBIBOARD.add_function(func, name) first.")
+        end
+        copy = name
     else -- number, string, boolean, etc
         copy = orig
     end
@@ -306,14 +348,26 @@ function BASE_ARBIBOARD.shallow_copy(orig)
 end
 
 ---@param orig table
-function BASE_ARBIBOARD.trim_table(orig)
+function BASE_ARBIBOARD._trim_table(orig)
     copy = {}
     for orig_key, orig_value in pairs(orig) do
         if type(orig_value) == 'table' then
             orig_value = rawget(orig_value, "BASE_FIELD_gameobject_id")
+        elseif type(orig_value) == 'function' then
+            local name = BASE_ARBIBOARD._functions[orig_value]
+            if name == nil then
+                error("BASE_ARBIBOARD.trim_table: encountered unregistered function value; register it with BASE_ARBIBOARD.add_function(func, name) first.")
+            end
+            orig_value = name
         end
         if type(orig_key) == 'table' then
             orig_key = rawget(orig_key, "BASE_FIELD_gameobject_id")
+        elseif type(orig_key) == 'function' then
+            local kname = BASE_ARBIBOARD._functions[orig_key]
+            if kname == nil then
+                error("BASE_ARBIBOARD.trim_table: encountered unregistered function key; register it with BASE_ARBIBOARD.add_function(func, name) first.")
+            end
+            orig_key = kname
         end
         copy[orig_key] = orig_value
     end
@@ -329,9 +383,9 @@ local function _replay_reset_to_beginning()
         error("ERROR FROM BASE SCRIPT: Replay fallback requires prior init request.")
     end
     -- Clear any browsing-layer edits, then re-run init on the browsing layer
-    BASE_ARBIBOARD.restore_all_tables()
+    BASE_ARBIBOARD._restore_all_tables()
     local message = API.init(BASE_ARBIBOARD._init_request)
-    BASE_ARBIBOARD.commit_all_tables(BASE_ARBIBOARD._init_request)
+    BASE_ARBIBOARD._commit_all_tables(BASE_ARBIBOARD._init_request)
     if type(message) ~= "string" then
         error("ERROR FROM BASE SCRIPT: API.init must return a string message for replay fallback.")
     end
@@ -343,10 +397,10 @@ local function _replay_apply_move_request(req)
     end
     local ok, msg = API.move(req)
     if ok ~= true then
-        BASE_ARBIBOARD.restore_all_tables()
+        BASE_ARBIBOARD._restore_all_tables()
         error("ERROR FROM BASE SCRIPT: Replay failed on a move request. The move did not succeed during replay.")
     end
-    BASE_ARBIBOARD.commit_all_tables(req)
+    BASE_ARBIBOARD._commit_all_tables(req)
 end
 
 local function _replay_range(from_idx_inclusive, to_idx_inclusive)
@@ -354,6 +408,56 @@ local function _replay_range(from_idx_inclusive, to_idx_inclusive)
         local req = BASE_ARBIBOARD._history[i]
         if req ~= nil then
             _replay_apply_move_request(req)
+        end
+    end
+end
+
+
+
+local function _apply_map_set(obj, map)
+    for k, v in pairs(map or {}) do
+        obj[_resolve_id(k)] = _resolve_id(v)
+    end
+end
+
+local function _apply_map_unset(obj, map)
+    for k, _ in pairs(map or {}) do
+        obj[_resolve_id(k)] = nil
+    end
+end
+
+local function _apply_step_forward(step)
+    -- Apply changes to move forward one step
+    for oid, changes in pairs(step) do
+        if type(changes) == "table" then
+            local obj = BASE_ARBIBOARD._object_registry[oid]
+            if not obj then
+                error("ERROR FROM BASE SCRIPT: History refers to unknown object id: " .. tostring(oid))
+            end
+            -- Remove keys that were removed in that move
+            _apply_map_unset(obj, changes.removed)
+            -- Add keys that were added in that move
+            _apply_map_set(obj, changes.added)
+            -- Apply modified to new values
+            _apply_map_set(obj, changes.modified_new)
+        end
+    end
+end
+
+local function _apply_step_backward(step)
+    -- Apply inverse of a step (to go back one move)
+    for oid, changes in pairs(step) do
+        if type(changes) == "table" then
+            local obj = BASE_ARBIBOARD._object_registry[oid]
+            if not obj then
+                error("ERROR FROM BASE SCRIPT: History refers to unknown object id: " .. tostring(oid))
+            end
+            -- Undo additions
+            _apply_map_unset(obj, changes.added)
+            -- Restore removals
+            _apply_map_set(obj, changes.removed)
+            -- Restore modified to old values
+            _apply_map_set(obj, changes.modified_old)
         end
     end
 end
@@ -380,7 +484,7 @@ function BASE_ARBIBOARD.history_exit()
         return
     end
     -- Discard browsing-layer mutations and close the layer
-    BASE_ARBIBOARD.restore_all_tables()
+    BASE_ARBIBOARD._restore_all_tables()
     BASE_ARBIBOARD._modified_tables[BASE_ARBIBOARD._transaction_layer] = nil
     BASE_ARBIBOARD._transaction_layer = BASE_ARBIBOARD._transaction_layer - 1
     BASE_ARBIBOARD._history_cursor = nil
